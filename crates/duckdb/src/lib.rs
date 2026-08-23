@@ -791,21 +791,28 @@ mod test {
     fn query_progress_handle_close_race_disarms_all_readers() {
         let db = checked_memory_handle();
         let handle = db.query_progress_handle();
-        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
 
         std::thread::scope(|scope| {
             let reader = handle.clone();
-            let reader_start = start.clone();
             let join = scope.spawn(move || {
-                reader_start.wait();
-                while reader.query_progress().is_some() {
+                assert!(reader.query_progress().is_some());
+                ready_tx.send(()).unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while std::time::Instant::now() < deadline {
+                    if reader.query_progress().is_none() {
+                        return true;
+                    }
                     std::thread::yield_now();
                 }
+                false
             });
 
-            start.wait();
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("progress reader did not start");
             db.close().unwrap();
-            join.join().unwrap();
+            assert!(join.join().unwrap(), "progress reader was not disarmed after close");
         });
 
         for _ in 0..100 {
@@ -817,21 +824,28 @@ mod test {
     fn query_progress_handle_drop_race_disarms_all_readers() {
         let db = checked_memory_handle();
         let handle = db.query_progress_handle();
-        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
 
         std::thread::scope(|scope| {
             let reader = handle.clone();
-            let reader_start = start.clone();
             let join = scope.spawn(move || {
-                reader_start.wait();
-                while reader.query_progress().is_some() {
+                assert!(reader.query_progress().is_some());
+                ready_tx.send(()).unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while std::time::Instant::now() < deadline {
+                    if reader.query_progress().is_none() {
+                        return true;
+                    }
                     std::thread::yield_now();
                 }
+                false
             });
 
-            start.wait();
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("progress reader did not start");
             drop(db);
-            join.join().unwrap();
+            assert!(join.join().unwrap(), "progress reader was not disarmed after drop");
         });
 
         std::thread::scope(|scope| {
