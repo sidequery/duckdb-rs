@@ -48,21 +48,22 @@ impl Drop for NativeDataChunk {
 
 /// A lazy iterator over owned native DuckDB data chunks.
 pub struct NativeDataChunkStream<'stmt, 'conn> {
-    stmt: Option<&'stmt mut Statement<'conn>>,
+    stmt: &'stmt mut Statement<'conn>,
+    exhausted: bool,
 }
 
 impl<'stmt, 'conn> NativeDataChunkStream<'stmt, 'conn> {
     pub(crate) fn new(stmt: &'stmt mut Statement<'conn>) -> Self {
-        Self { stmt: Some(stmt) }
+        Self { stmt, exhausted: false }
     }
 
-    /// Return the schema reported by DuckDB after execution.
-    pub fn get_schema(&self) -> SchemaRef {
-        self.stmt
-            .as_ref()
-            .expect("native chunk iterator always holds a statement")
-            .stmt
-            .schema()
+    /// Return the Arrow-compatible schema reported by DuckDB after execution.
+    ///
+    /// Native chunks can contain DuckDB types, such as VARIANT, that do not
+    /// have an Arrow representation. Those chunks remain iterable, while this
+    /// method returns an error.
+    pub fn get_schema(&self) -> Result<SchemaRef> {
+        self.stmt.stmt.try_schema()
     }
 }
 
@@ -70,14 +71,17 @@ impl Iterator for NativeDataChunkStream<'_, '_> {
     type Item = Result<NativeDataChunk>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.stmt.as_deref()?.step_native_chunk() {
+        if self.exhausted {
+            return None;
+        }
+        match self.stmt.step_native_chunk() {
             Ok(Some(chunk)) => Some(Ok(chunk)),
             Ok(None) => {
-                self.stmt = None;
+                self.exhausted = true;
                 None
             }
             Err(error) => {
-                self.stmt = None;
+                self.exhausted = true;
                 Some(Err(error))
             }
         }

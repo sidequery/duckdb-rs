@@ -135,6 +135,11 @@ impl RawStatement {
     }
 
     #[inline]
+    pub(crate) fn try_schema(&self) -> Result<SchemaRef> {
+        self.executed().try_schema_ref().cloned()
+    }
+
+    #[inline]
     fn schema_ref(&self) -> &SchemaRef {
         self.executed().schema_ref()
     }
@@ -178,6 +183,19 @@ impl RawStatement {
             let rc = ffi::duckdb_execute_prepared_streaming(self.ptr, &mut out);
             result_from_duckdb_result(rc, &mut out)?;
             self.result = Some(ExecutedResult::new(out)?);
+
+            Ok(())
+        }
+    }
+
+    pub(crate) fn execute_streaming_native(&mut self) -> Result<()> {
+        self.reset_result();
+        unsafe {
+            let mut out: ffi::duckdb_result = std::mem::zeroed();
+
+            let rc = ffi::duckdb_execute_prepared_streaming(self.ptr, &mut out);
+            result_from_duckdb_result(rc, &mut out)?;
+            self.result = Some(ExecutedResult::new_native(out)?);
 
             Ok(())
         }

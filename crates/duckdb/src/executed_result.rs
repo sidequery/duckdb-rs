@@ -30,9 +30,8 @@ use polars_core::utils::arrow as polars_arrow;
 pub(crate) struct ExecutedResult {
     arrow_options: ArrowOptionsHandle,
     result: DuckdbResultHandle,
-    schema: SchemaRef,
+    arrow_metadata: Option<ArrowResultMetadata>,
     columns: Box<[ResultColumn]>,
-    arrow_schema: FFI_ArrowSchema,
     exhausted: Cell<bool>,
     column_name_cache: OnceCell<HashMap<Box<str>, usize>>,
     #[cfg(feature = "polars")]
@@ -52,6 +51,12 @@ struct ResultColumn {
     logical_type: LogicalTypeHandle,
 }
 
+#[derive(Debug)]
+struct ArrowResultMetadata {
+    schema: SchemaRef,
+    ffi_schema: FFI_ArrowSchema,
+}
+
 impl ExecutedResult {
     /// Takes ownership of a DuckDB result.
     ///
@@ -61,15 +66,36 @@ impl ExecutedResult {
     /// This function takes ownership unconditionally: after it is called, the
     /// result is destroyed by `ExecutedResult` even if metadata loading fails.
     pub(crate) unsafe fn new(result: ffi::duckdb_result) -> Result<Self> {
+        unsafe { Self::new_with_metadata(result, true) }
+    }
+
+    /// Construct a result for consumers of native DuckDB vectors.
+    ///
+    /// Native consumers do not require every logical type to have an Arrow
+    /// representation, so Arrow metadata is retained when available and
+    /// omitted for results containing types such as VARIANT.
+    pub(crate) unsafe fn new_native(result: ffi::duckdb_result) -> Result<Self> {
+        unsafe { Self::new_with_metadata(result, false) }
+    }
+
+    unsafe fn new_with_metadata(result: ffi::duckdb_result, require_arrow: bool) -> Result<Self> {
         let result = DuckdbResultHandle::new(result);
         let arrow_options = unsafe { ArrowOptionsHandle::new(&result)? };
-        let (schema, columns, arrow_schema) = unsafe { Self::load_schema_and_columns(&result, &arrow_options)? };
+        let columns = unsafe { Self::load_result_columns(result.as_mut_ptr(), require_arrow)? };
+        let arrow_metadata = if require_arrow
+            || !columns
+                .iter()
+                .any(|column| column.logical_type.contains_type_id(LogicalTypeId::Variant))
+        {
+            Some(unsafe { Self::load_arrow_metadata(&columns, &arrow_options)? })
+        } else {
+            None
+        };
         Ok(Self {
             arrow_options,
             result,
-            schema,
+            arrow_metadata,
             columns,
-            arrow_schema,
             exhausted: Cell::new(false),
             column_name_cache: OnceCell::new(),
             #[cfg(feature = "polars")]
@@ -121,7 +147,26 @@ impl ExecutedResult {
     }
 
     pub(crate) fn schema_ref(&self) -> &SchemaRef {
-        &self.schema
+        &self
+            .arrow_metadata
+            .as_ref()
+            .expect("executed result has no Arrow-compatible schema")
+            .schema
+    }
+
+    pub(crate) fn try_schema_ref(&self) -> Result<&SchemaRef> {
+        self.arrow_metadata
+            .as_ref()
+            .map(|metadata| &metadata.schema)
+            .ok_or_else(|| {
+                let (idx, _) = self
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .find(|(_, column)| column.logical_type.contains_type_id(LogicalTypeId::Variant))
+                    .expect("native-only result metadata requires an unsupported Arrow type");
+                unsupported_result_logical_type_error(idx, Type::Variant)
+            })
     }
 
     pub(crate) fn result_column_logical_id(&self, idx: usize) -> LogicalTypeId {
@@ -137,7 +182,10 @@ impl ExecutedResult {
     }
 
     pub(crate) fn column_name(&self, idx: usize) -> Option<&String> {
-        self.schema.fields().get(idx).map(|field| field.name())
+        self.arrow_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.schema.fields().get(idx))
+            .map(|field| field.name())
     }
 
     pub(crate) fn column_index(&self, name: &str) -> Option<usize> {
@@ -156,16 +204,15 @@ impl ExecutedResult {
         cache
     }
 
-    unsafe fn load_schema_and_columns(
-        result: &DuckdbResultHandle,
+    unsafe fn load_arrow_metadata(
+        columns: &[ResultColumn],
         arrow_options: &ArrowOptionsHandle,
-    ) -> Result<(SchemaRef, Box<[ResultColumn]>, FFI_ArrowSchema)> {
+    ) -> Result<ArrowResultMetadata> {
         unsafe {
             let mut arrow_schema = FFI_ArrowSchema::empty();
-            let columns = Self::load_result_columns(result.as_mut_ptr())?;
             Self::export_arrow_schema(
                 arrow_options,
-                &columns,
+                columns,
                 &mut arrow_schema as *mut _ as *mut ffi::ArrowSchema,
             )?;
             let schema = Arc::new(
@@ -178,18 +225,26 @@ impl ExecutedResult {
                 "result schema and column cache are built from the same DuckDB column count"
             );
 
-            Ok((schema, columns, arrow_schema))
+            Ok(ArrowResultMetadata {
+                schema,
+                ffi_schema: arrow_schema,
+            })
         }
     }
 
-    unsafe fn load_result_columns(result: *mut ffi::duckdb_result) -> Result<Box<[ResultColumn]>> {
+    unsafe fn load_result_columns(
+        result: *mut ffi::duckdb_result,
+        reject_unsupported_arrow_types: bool,
+    ) -> Result<Box<[ResultColumn]>> {
         unsafe {
             let column_count = ffi::duckdb_column_count(result) as usize;
             let mut columns = Vec::with_capacity(column_count);
 
             for idx in 0..column_count {
                 let logical_type = Self::try_result_column_logical_type(result, idx)?;
-                reject_unsupported_result_logical_type(idx, &logical_type)?;
+                if reject_unsupported_arrow_types {
+                    reject_unsupported_result_logical_type(idx, &logical_type)?;
+                }
 
                 let name = ffi::duckdb_column_name(result, idx as u64);
                 if name.is_null() {
@@ -277,8 +332,15 @@ impl ExecutedResult {
             let mut arrays = FFI_ArrowArray::empty();
             self.chunk_to_arrow(chunk, &mut arrays as *mut _ as *mut ffi::ArrowArray)?;
 
-            let array_data = from_ffi(arrays, &self.arrow_schema)
-                .map_err(|err| arrow_conversion_failure("Could not import DuckDB Arrow array", err))?;
+            let array_data = from_ffi(
+                arrays,
+                &self
+                    .arrow_metadata
+                    .as_ref()
+                    .expect("Arrow conversion requires Arrow-compatible result metadata")
+                    .ffi_schema,
+            )
+            .map_err(|err| arrow_conversion_failure("Could not import DuckDB Arrow array", err))?;
             Ok(StructArray::from(array_data))
         }
     }
@@ -333,14 +395,14 @@ pub(crate) unsafe fn logical_type_from_duckdb_column(
 
 pub(crate) fn reject_unsupported_result_logical_type(idx: usize, logical_type: &LogicalTypeHandle) -> Result<()> {
     if logical_type.contains_type_id(LogicalTypeId::Variant) {
-        return Err(Error::FromSqlConversionFailure(
-            idx,
-            Type::Variant,
-            "decoding Variant columns is not supported".into(),
-        ));
+        return Err(unsupported_result_logical_type_error(idx, Type::Variant));
     }
 
     Ok(())
+}
+
+fn unsupported_result_logical_type_error(idx: usize, data_type: Type) -> Error {
+    Error::FromSqlConversionFailure(idx, data_type, "decoding Variant columns is not supported".into())
 }
 
 /// Owned DuckDB result handle.
