@@ -770,6 +770,82 @@ mod test {
         assert_eq!(handle.query_progress(), None);
     }
 
+    #[test]
+    fn query_progress_handle_supports_concurrent_reads() {
+        let db = checked_memory_handle();
+        let handle = db.query_progress_handle();
+
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let handle = handle.clone();
+                scope.spawn(move || {
+                    for _ in 0..100 {
+                        assert!(handle.query_progress().is_some());
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn query_progress_handle_close_race_disarms_all_readers() {
+        let db = checked_memory_handle();
+        let handle = db.query_progress_handle();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        std::thread::scope(|scope| {
+            let reader = handle.clone();
+            let reader_start = start.clone();
+            let join = scope.spawn(move || {
+                reader_start.wait();
+                while reader.query_progress().is_some() {
+                    std::thread::yield_now();
+                }
+            });
+
+            start.wait();
+            db.close().unwrap();
+            join.join().unwrap();
+        });
+
+        for _ in 0..100 {
+            assert_eq!(handle.query_progress(), None);
+        }
+    }
+
+    #[test]
+    fn query_progress_handle_drop_race_disarms_all_readers() {
+        let db = checked_memory_handle();
+        let handle = db.query_progress_handle();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        std::thread::scope(|scope| {
+            let reader = handle.clone();
+            let reader_start = start.clone();
+            let join = scope.spawn(move || {
+                reader_start.wait();
+                while reader.query_progress().is_some() {
+                    std::thread::yield_now();
+                }
+            });
+
+            start.wait();
+            drop(db);
+            join.join().unwrap();
+        });
+
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let handle = handle.clone();
+                scope.spawn(move || {
+                    for _ in 0..100 {
+                        assert_eq!(handle.query_progress(), None);
+                    }
+                });
+            }
+        });
+    }
+
     pub fn checked_memory_handle() -> Connection {
         Connection::open_in_memory().unwrap()
     }

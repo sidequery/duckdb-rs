@@ -1741,7 +1741,9 @@ mod test {
         let db = Connection::open_in_memory()?;
         for sql in [
             "SELECT {'a': 42}::VARIANT AS variant_col",
+            "SELECT [123::VARIANT] AS variant_list",
             "SELECT {'v': 123::VARIANT} AS variant_struct",
+            "SELECT map(['v'], [123::VARIANT]) AS variant_map",
         ] {
             let mut stmt = db.prepare(sql)?;
             let mut stream = stmt.stream_native_chunks([])?;
@@ -1752,6 +1754,41 @@ mod test {
             assert!(stream.next().is_none());
             assert_variant_decode_error(stream.get_schema().unwrap_err(), 0);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_stream_native_chunks_accepts_variant_returning() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE t(id INTEGER, v VARIANT);")?;
+        let mut stmt = db.prepare("INSERT INTO t VALUES (1, {'a': 42}::VARIANT) RETURNING v")?;
+        let mut stream = stmt.stream_native_chunks([])?;
+
+        assert_eq!(stream.next().expect("expected a native chunk")?.len(), 1);
+        assert!(stream.next().is_none());
+        drop(stream);
+        drop(stmt);
+
+        let count: i64 = db.query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))?;
+        assert_eq!(count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_native_chunk_outlives_stream_and_statement() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        let chunk = {
+            let mut stmt = db.prepare("SELECT i FROM range(10) AS t(i)")?;
+            let mut stream = stmt.stream_native_chunks([])?;
+            stream.next().expect("expected a native chunk")?
+        };
+
+        assert_eq!(chunk.len(), 10);
+        let vector = unsafe { ffi::duckdb_data_chunk_get_vector(chunk.as_raw(), 0) };
+        assert!(!vector.is_null());
+        let data = unsafe { ffi::duckdb_vector_get_data(vector).cast::<i64>() };
+        assert!(!data.is_null());
+        assert_eq!(unsafe { *data.add(9) }, 9);
         Ok(())
     }
 
