@@ -68,6 +68,7 @@ use std::{
 
 use crate::{cache::StatementCache, inner_connection::InnerConnection, raw_statement::RawStatement, types::ValueRef};
 
+pub use crate::native_chunk::{NativeDataChunk, NativeDataChunkStream};
 #[cfg(feature = "r2d2")]
 pub use crate::r2d2::DuckdbConnectionManager;
 pub use crate::{
@@ -113,6 +114,7 @@ mod column;
 mod config;
 mod executed_result;
 mod inner_connection;
+mod native_chunk;
 mod params;
 
 #[cfg(feature = "polars")]

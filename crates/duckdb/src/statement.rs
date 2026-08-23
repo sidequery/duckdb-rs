@@ -9,6 +9,7 @@ use crate::polars_dataframe::Polars;
 use crate::{
     arrow_batch::{Arrow, ArrowStream},
     error::result_from_duckdb_prepare,
+    native_chunk::NativeDataChunkStream,
     types::{
         ToSql, ToSqlOutput, binding_unsupported_value, to_duckdb_hugeint, to_duckdb_uhugeint, value_ref_from_value,
     },
@@ -30,7 +31,7 @@ pub struct Statement<'conn> {
     pub(crate) stmt: RawStatement,
 }
 
-impl Statement<'_> {
+impl<'conn> Statement<'conn> {
     /// Execute the prepared statement.
     ///
     /// On success, returns the number of rows that were changed or inserted or
@@ -156,6 +157,25 @@ impl Statement<'_> {
         params.__bind_in(self)?;
         self.stmt.execute_streaming()?;
         Ok(ArrowStream::new(self))
+    }
+
+    /// Execute the prepared statement and lazily stream owned native DuckDB data chunks.
+    ///
+    /// Each chunk owns its DuckDB handle and destroys it when dropped. The raw handle
+    /// returned by [`NativeDataChunk::as_raw`](crate::NativeDataChunk::as_raw) remains
+    /// valid only while that chunk is alive. Native chunks can contain DuckDB logical
+    /// types without an Arrow representation; in that case
+    /// [`NativeDataChunkStream::get_schema`] returns an error while iteration remains
+    /// available.
+    #[inline]
+    pub fn stream_native_chunks<P: Params>(&mut self, params: P) -> Result<NativeDataChunkStream<'_, 'conn>> {
+        params.__bind_in(self)?;
+        self.stmt.execute_streaming_native()?;
+        Ok(NativeDataChunkStream::new(self))
+    }
+
+    pub(crate) fn step_native_chunk(&self) -> Result<Option<crate::native_chunk::NativeDataChunk>> {
+        self.stmt.step_native()
     }
 
     /// Execute the prepared statement, returning a handle to the resulting
@@ -694,7 +714,7 @@ mod test {
     use crate::{
         Connection, Error, Result, Statement,
         core::LogicalTypeId,
-        params_from_iter,
+        ffi, params_from_iter,
         types::{Decimal, ListType, ToSql, ToSqlOutput, Type, ValueRef},
     };
 
@@ -1669,6 +1689,86 @@ mod test {
         assert!(stream.next().is_none());
         assert!(stream.next().is_none());
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_stream_native_chunks_with_params_and_clean_eof() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        let mut stmt = db.prepare("SELECT i FROM range(3000) AS t(i) WHERE i < ? ORDER BY i")?;
+        let mut stream = stmt.stream_native_chunks([2500_i64])?;
+
+        let schema = stream.get_schema()?;
+        assert_eq!(schema.fields().len(), 1);
+        assert_eq!(schema.field(0).name(), "i");
+
+        let mut values = Vec::new();
+        for chunk in stream.by_ref() {
+            let chunk = chunk?;
+            assert!(!chunk.is_empty());
+            let vector = unsafe { ffi::duckdb_data_chunk_get_vector(chunk.as_raw(), 0) };
+            assert!(!vector.is_null());
+            let data = unsafe { ffi::duckdb_vector_get_data(vector).cast::<i64>() };
+            assert!(!data.is_null());
+            values.extend((0..chunk.len()).map(|row| unsafe { *data.add(row) }));
+        }
+
+        assert_eq!(values.len(), 2500);
+        assert_eq!(values[0], 0);
+        assert_eq!(values[2048], 2048);
+        assert_eq!(values[2499], 2499);
+        assert!(stream.next().is_none());
+        assert!(stream.next().is_none());
+        assert_eq!(stream.get_schema()?.field(0).name(), "i");
+        Ok(())
+    }
+
+    #[test]
+    fn test_stream_native_chunks_empty_result() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        let mut stmt = db.prepare("SELECT 1 AS x WHERE false")?;
+        let mut stream = stmt.stream_native_chunks([])?;
+
+        assert_eq!(stream.get_schema()?.field(0).name(), "x");
+        assert!(stream.next().is_none());
+        assert!(stream.next().is_none());
+        assert_eq!(stream.get_schema()?.field(0).name(), "x");
+        Ok(())
+    }
+
+    #[test]
+    fn test_stream_native_chunks_supports_variant_without_arrow_schema() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        for sql in [
+            "SELECT {'a': 42}::VARIANT AS variant_col",
+            "SELECT {'v': 123::VARIANT} AS variant_struct",
+        ] {
+            let mut stmt = db.prepare(sql)?;
+            let mut stream = stmt.stream_native_chunks([])?;
+
+            assert_variant_decode_error(stream.get_schema().unwrap_err(), 0);
+            let chunk = stream.next().expect("expected native Variant chunk")?;
+            assert_eq!(chunk.len(), 1);
+            assert!(stream.next().is_none());
+            assert_variant_decode_error(stream.get_schema().unwrap_err(), 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_stream_native_chunks_preserves_schema_after_fetch_error() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        let interrupt = db.interrupt_handle();
+        let mut stmt = db.prepare("SELECT i FROM range(100000000) AS t(i)")?;
+        let mut stream = stmt.stream_native_chunks([])?;
+
+        assert_eq!(stream.get_schema()?.field(0).name(), "i");
+        assert!(stream.next().expect("expected first chunk")?.len() > 0);
+        interrupt.interrupt();
+        let err = stream.next().expect("expected interrupted fetch").unwrap_err();
+        assert!(err.to_string().contains("Interrupted"));
+        assert!(stream.next().is_none());
+        assert_eq!(stream.get_schema()?.field(0).name(), "i");
         Ok(())
     }
 

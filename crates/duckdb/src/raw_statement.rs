@@ -11,6 +11,7 @@ use crate::{
     core::{LogicalTypeHandle, LogicalTypeId},
     error::result_from_duckdb_result,
     executed_result::{ExecutedResult, logical_type_from_duckdb_column, reject_unsupported_result_logical_type},
+    native_chunk::NativeDataChunk,
 };
 #[cfg(feature = "polars")]
 use polars_core::utils::arrow as polars_arrow;
@@ -84,6 +85,11 @@ impl RawStatement {
         self.result.as_ref().map_or(Ok(None), ExecutedResult::step)
     }
 
+    #[inline]
+    pub(crate) fn step_native(&self) -> Result<Option<NativeDataChunk>> {
+        self.result.as_ref().map_or(Ok(None), ExecutedResult::step_native)
+    }
+
     #[cfg(feature = "polars")]
     #[inline]
     pub(crate) fn step_polars(&self) -> Result<Option<polars_arrow::array::StructArray>> {
@@ -126,6 +132,11 @@ impl RawStatement {
     #[inline]
     pub fn schema(&self) -> SchemaRef {
         self.schema_ref().clone()
+    }
+
+    #[inline]
+    pub(crate) fn try_schema(&self) -> Result<SchemaRef> {
+        self.executed().try_schema_ref().cloned()
     }
 
     #[inline]
@@ -172,6 +183,19 @@ impl RawStatement {
             let rc = ffi::duckdb_execute_prepared_streaming(self.ptr, &mut out);
             result_from_duckdb_result(rc, &mut out)?;
             self.result = Some(ExecutedResult::new(out)?);
+
+            Ok(())
+        }
+    }
+
+    pub(crate) fn execute_streaming_native(&mut self) -> Result<()> {
+        self.reset_result();
+        unsafe {
+            let mut out: ffi::duckdb_result = std::mem::zeroed();
+
+            let rc = ffi::duckdb_execute_prepared_streaming(self.ptr, &mut out);
+            result_from_duckdb_result(rc, &mut out)?;
+            self.result = Some(ExecutedResult::new_native(out)?);
 
             Ok(())
         }
