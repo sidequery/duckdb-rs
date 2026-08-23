@@ -80,7 +80,7 @@ pub use crate::{
     config::{AccessMode, Config, DefaultNullOrder, DefaultOrder},
     error::Error,
     ffi::ErrorCode,
-    inner_connection::InterruptHandle,
+    inner_connection::{InterruptHandle, QueryProgress, QueryProgressHandle},
     params::{Params, ParamsFromIter, params_from_iter},
     row::{AndThenRows, Map, MappedRows, Row, RowIndex, Rows},
     statement::Statement,
@@ -674,6 +674,12 @@ impl Connection {
         self.db.borrow().get_interrupt_handle()
     }
 
+    /// Returns a cloneable handle for observing progress of queries executed
+    /// by this connection from another thread.
+    pub fn query_progress_handle(&self) -> QueryProgressHandle {
+        self.db.borrow().get_query_progress_handle()
+    }
+
     /// Close the DuckDB connection.
     ///
     /// This is functionally equivalent to the `Drop` implementation for
@@ -739,6 +745,119 @@ mod test {
         }
 
         assert_send::<Connection>();
+    }
+
+    #[test]
+    fn query_progress_handle_is_send_sync_and_cloneable() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<QueryProgressHandle>();
+
+        let db = checked_memory_handle();
+        let handle = db.query_progress_handle();
+        let cloned = handle.clone();
+        assert!(handle.query_progress().is_some());
+        assert!(cloned.query_progress().is_some());
+    }
+
+    #[test]
+    fn query_progress_handle_is_disarmed_when_connection_closes() {
+        let db = checked_memory_handle();
+        let handle = db.query_progress_handle();
+        assert!(handle.query_progress().is_some());
+
+        db.close().unwrap();
+
+        assert_eq!(handle.query_progress(), None);
+    }
+
+    #[test]
+    fn query_progress_handle_supports_concurrent_reads() {
+        let db = checked_memory_handle();
+        let handle = db.query_progress_handle();
+
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let handle = handle.clone();
+                scope.spawn(move || {
+                    for _ in 0..100 {
+                        assert!(handle.query_progress().is_some());
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn query_progress_handle_close_race_disarms_all_readers() {
+        let db = checked_memory_handle();
+        let handle = db.query_progress_handle();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+
+        std::thread::scope(|scope| {
+            let reader = handle.clone();
+            let join = scope.spawn(move || {
+                assert!(reader.query_progress().is_some());
+                ready_tx.send(()).unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while std::time::Instant::now() < deadline {
+                    if reader.query_progress().is_none() {
+                        return true;
+                    }
+                    std::thread::yield_now();
+                }
+                false
+            });
+
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("progress reader did not start");
+            db.close().unwrap();
+            assert!(join.join().unwrap(), "progress reader was not disarmed after close");
+        });
+
+        for _ in 0..100 {
+            assert_eq!(handle.query_progress(), None);
+        }
+    }
+
+    #[test]
+    fn query_progress_handle_drop_race_disarms_all_readers() {
+        let db = checked_memory_handle();
+        let handle = db.query_progress_handle();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+
+        std::thread::scope(|scope| {
+            let reader = handle.clone();
+            let join = scope.spawn(move || {
+                assert!(reader.query_progress().is_some());
+                ready_tx.send(()).unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while std::time::Instant::now() < deadline {
+                    if reader.query_progress().is_none() {
+                        return true;
+                    }
+                    std::thread::yield_now();
+                }
+                false
+            });
+
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("progress reader did not start");
+            drop(db);
+            assert!(join.join().unwrap(), "progress reader was not disarmed after drop");
+        });
+
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let handle = handle.clone();
+                scope.spawn(move || {
+                    for _ in 0..100 {
+                        assert_eq!(handle.query_progress(), None);
+                    }
+                });
+            }
+        });
     }
 
     pub fn checked_memory_handle() -> Connection {
