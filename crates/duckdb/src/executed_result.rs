@@ -20,6 +20,7 @@ use crate::{
     error::{
         arrow_conversion_failure, duckdb_failure_from_message, result_error_message, result_from_duckdb_error_data,
     },
+    native_chunk::NativeDataChunk,
     types::Type,
 };
 #[cfg(feature = "polars")]
@@ -86,6 +87,13 @@ impl ExecutedResult {
                 return Ok(None);
             };
             self.data_chunk_to_struct_array(chunk).map(Some)
+        }
+    }
+
+    pub(crate) fn step_native(&self) -> Result<Option<NativeDataChunk>> {
+        unsafe {
+            self.next_chunk()
+                .map(|chunk| chunk.map(|chunk| NativeDataChunk::from_raw(chunk)))
         }
     }
 

@@ -11,6 +11,7 @@ use crate::{
     core::{LogicalTypeHandle, LogicalTypeId},
     error::result_from_duckdb_result,
     executed_result::{ExecutedResult, logical_type_from_duckdb_column, reject_unsupported_result_logical_type},
+    native_chunk::NativeDataChunk,
 };
 #[cfg(feature = "polars")]
 use polars_core::utils::arrow as polars_arrow;
@@ -82,6 +83,11 @@ impl RawStatement {
     #[inline]
     pub fn step(&self) -> Result<Option<StructArray>> {
         self.result.as_ref().map_or(Ok(None), ExecutedResult::step)
+    }
+
+    #[inline]
+    pub(crate) fn step_native(&self) -> Result<Option<NativeDataChunk>> {
+        self.result.as_ref().map_or(Ok(None), ExecutedResult::step_native)
     }
 
     #[cfg(feature = "polars")]
