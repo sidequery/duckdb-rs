@@ -515,6 +515,19 @@ impl Connection {
             .and_then(f)
     }
 
+    /// Parse SQL and return its statement count without binding or executing it.
+    ///
+    /// Uses this connection's parser settings and the database's loaded parser
+    /// extensions. Referenced tables and functions do not need to exist. Empty
+    /// input and comments return zero; invalid SQL returns an error.
+    ///
+    /// Unlike [`Connection::prepare`], this never executes preceding statements
+    /// when the input contains multiple statements.
+    #[inline]
+    pub fn extract_statement_count(&self, sql: &str) -> Result<usize> {
+        self.db.borrow_mut().extract_statement_count(sql)
+    }
+
     /// Prepare a SQL statement for execution.
     ///
     /// ## Example
@@ -737,6 +750,25 @@ mod test {
 
     use arrow::{array::Int32Array, datatypes::DataType, record_batch::RecordBatch};
     use fallible_iterator::FallibleIterator;
+
+    #[test]
+    fn extract_statement_count_does_not_bind_or_execute() -> Result<()> {
+        let connection = Connection::open_in_memory()?;
+        assert_eq!(connection.extract_statement_count("-- empty\n /* comment */")?, 0);
+        assert_eq!(connection.extract_statement_count("SELECT * FROM absent_table")?, 1);
+        assert_eq!(
+            connection
+                .extract_statement_count("CREATE TABLE untouched(id INTEGER); INSERT INTO untouched VALUES (1)")?,
+            2
+        );
+        assert!(connection.prepare("SELECT * FROM untouched").is_err());
+        assert_eq!(connection.extract_statement_count("SELECT ';' /* ; */; SELECT 2")?, 2);
+        assert!(connection.extract_statement_count("SELECT FROM").is_err());
+        assert!(connection.extract_statement_count("SELECT\0 1").is_err());
+        // Extraction errors leave the connection usable.
+        assert_eq!(connection.extract_statement_count("SELECT 1")?, 1);
+        Ok(())
+    }
 
     #[test]
     fn connection_is_send() {
