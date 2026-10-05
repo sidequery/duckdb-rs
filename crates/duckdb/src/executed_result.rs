@@ -58,6 +58,48 @@ struct ArrowResultMetadata {
 }
 
 impl ExecutedResult {
+    /// Export prepared result metadata without executing or rebinding the statement.
+    pub(crate) unsafe fn prepared_schema(
+        statement: ffi::duckdb_prepared_statement,
+        connection: ffi::duckdb_connection,
+    ) -> Result<SchemaRef> {
+        unsafe {
+            let count = ffi::duckdb_prepared_statement_column_count(statement);
+            let mut columns = Vec::with_capacity(count as usize);
+            for idx in 0..count {
+                let logical_type = logical_type_from_duckdb_column(
+                    ffi::duckdb_prepared_statement_column_logical_type(statement, idx),
+                    idx as usize,
+                )?;
+                if logical_type.contains_type_id(LogicalTypeId::Invalid)
+                    || logical_type.contains_type_id(LogicalTypeId::Any)
+                {
+                    return Err(duckdb_failure_from_message(format!(
+                        "Prepared result column {idx} has an unresolved logical type"
+                    )));
+                }
+                reject_unsupported_result_logical_type(idx as usize, &logical_type)?;
+                let name =
+                    ffi::DuckDbString::from_nullable_ptr(ffi::duckdb_prepared_statement_column_name(statement, idx))
+                        .ok_or_else(|| {
+                            duckdb_failure_from_message(format!(
+                                "Could not retrieve prepared result column name at index {idx}"
+                            ))
+                        })?;
+                columns.push(ResultColumn {
+                    name: name.to_owned(),
+                    logical_type,
+                });
+            }
+            let mut options = std::ptr::null_mut();
+            ffi::duckdb_connection_get_arrow_options(connection, &mut options);
+            let ptr = NonNull::new(options)
+                .ok_or_else(|| duckdb_failure_from_message("Could not retrieve Arrow options for connection"))?;
+            let options = ArrowOptionsHandle { ptr };
+            Ok(Self::load_arrow_metadata(&columns, &options)?.schema)
+        }
+    }
+
     /// Takes ownership of a DuckDB result.
     ///
     /// # Safety

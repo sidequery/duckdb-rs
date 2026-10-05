@@ -158,6 +158,30 @@ impl InnerConnection {
         Ok(Statement::new(conn, unsafe { RawStatement::new(final_stmt) }))
     }
 
+    pub fn extract_statement_count(&mut self, sql: &str) -> Result<usize> {
+        let sql = CString::new(sql)?;
+        let mut extracted = ptr::null_mut();
+        let count = unsafe { ffi::duckdb_extract_statements(self.con, sql.as_ptr(), &mut extracted) };
+        if extracted.is_null() {
+            return Err(Error::DuckDBFailure(
+                ffi::Error::new(ffi::DuckDBError),
+                Some("extracted statements are null".into()),
+            ));
+        }
+        let _guard = ExtractedStatementsGuard(extracted);
+        let message = unsafe { ffi::duckdb_extract_statements_error(extracted) };
+        if !message.is_null() {
+            let message = unsafe { CStr::from_ptr(message) }.to_string_lossy();
+            if !message.is_empty() {
+                return Err(Error::DuckDBFailure(
+                    ffi::Error::new(ffi::DuckDBError),
+                    Some(message.into_owned()),
+                ));
+            }
+        }
+        Ok(count as usize)
+    }
+
     fn prepare_extracted_statement(
         &self,
         extracted: ffi::duckdb_extracted_statements,

@@ -596,6 +596,29 @@ impl<'conn> Statement<'conn> {
         Rows::new(self)
     }
 
+    /// Returns the prepared result schema without executing the statement.
+    ///
+    /// Uses the connection's current Arrow conversion settings. This describes
+    /// types resolved during preparation; binding values does not rebind or infer
+    /// unresolved result types. Unsupported or unresolved types return an error.
+    /// After execution this still describes prepared metadata, not the result.
+    pub fn prepared_schema(&self) -> Result<SchemaRef> {
+        unsafe { crate::executed_result::ExecutedResult::prepared_schema(self.stmt.ptr(), self.conn.db.borrow().con) }
+    }
+
+    /// Returns a prepared result column's logical type without executing.
+    ///
+    /// The index is zero-based. This always reads prepared metadata, including
+    /// after execution; invalid indices return an error.
+    pub fn prepared_column_logical_type(&self, idx: usize) -> Result<crate::core::LogicalTypeHandle> {
+        unsafe {
+            crate::executed_result::logical_type_from_duckdb_column(
+                ffi::duckdb_prepared_statement_column_logical_type(self.stmt.ptr(), idx as u64),
+                idx,
+            )
+        }
+    }
+
     /// Returns the underlying schema of the prepared statement.
     ///
     /// # Caveats
@@ -1160,6 +1183,89 @@ mod test {
         let mut stmt = db.prepare("SELECT y FROM foo")?;
         let y: Result<i64> = stmt.query_row([], |r| r.get("y"));
         assert_eq!(3i64, y?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_prepared_schema_does_not_execute() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch("create sequence describe_seq; create table describe_rows(i integer)")?;
+        let stmt = db.prepare("select nextval('describe_seq') as tick limit 1")?;
+        assert_eq!(stmt.prepared_schema()?.field(0).name(), "tick");
+        assert_eq!(stmt.prepared_column_logical_type(0)?.id(), LogicalTypeId::Bigint);
+        assert!(stmt.prepared_column_logical_type(1).is_err());
+        assert_eq!(
+            db.query_row("select nextval('describe_seq')", [], |r| r.get::<_, i64>(0))?,
+            1
+        );
+        let stmt = db.prepare("insert into describe_rows values (42) returning i")?;
+        assert_eq!(stmt.prepared_schema()?.field(0).name(), "i");
+        assert_eq!(
+            db.query_row("select count(*) from describe_rows", [], |r| r.get::<_, i64>(0))?,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_prepared_schema_dml_returning() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch("create table prepared_dml(id uuid, amount decimal(38,12)); insert into prepared_dml values ('00000000-0000-0000-0000-000000000001', 1)")?;
+        for sql in [
+            "insert into prepared_dml values ('00000000-0000-0000-0000-000000000002', 2) returning id, amount",
+            "update prepared_dml set amount = 2 returning id, amount",
+            "delete from prepared_dml returning id, amount",
+            "merge into prepared_dml as t using (select '00000000-0000-0000-0000-000000000001'::uuid as id) as s on t.id = s.id when matched then update set amount = 3 returning t.id, t.amount",
+        ] {
+            let stmt = db.prepare(sql)?;
+            let schema = stmt.prepared_schema()?;
+            assert_eq!(schema.field(0).name(), "id");
+            assert_eq!(stmt.prepared_column_logical_type(0)?.id(), LogicalTypeId::Uuid);
+            assert_eq!(
+                schema.field(1).data_type(),
+                &arrow::datatypes::DataType::Decimal128(38, 12)
+            );
+        }
+        assert_eq!(
+            db.query_row("select count(*) from prepared_dml where amount = 1", [], |r| r
+                .get::<_, i64>(0))?,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_prepared_schema_matches_executed_types() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        for lossless in [false, true] {
+            db.execute_batch(&format!("set arrow_lossless_conversion = {lossless}"))?;
+            let mut stmt = db.prepare("select 1::decimal(38,12) as precise, '00000000-0000-0000-0000-000000000001'::uuid as id, [1,2] as items, now() as instant")?;
+            let prepared = stmt.prepared_schema()?;
+            assert_eq!(
+                prepared.field(0).data_type(),
+                &arrow::datatypes::DataType::Decimal128(38, 12)
+            );
+            assert_eq!(stmt.prepared_column_logical_type(1)?.id(), LogicalTypeId::Uuid);
+            let executed = stmt.query_arrow([])?.get_schema();
+            assert_eq!(prepared, executed);
+            assert_eq!(stmt.prepared_schema()?, prepared);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_prepared_schema_parameters_and_unsupported_types() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        let mut stmt = db.prepare("select cast(? as bigint) as value")?;
+        let schema = stmt.prepared_schema()?;
+        stmt.raw_bind_parameter(1, 42_i64)?;
+        assert_eq!(stmt.prepared_schema()?, schema);
+        assert_eq!(stmt.query_arrow([42_i64])?.get_schema(), schema);
+        let mut unresolved = db.prepare("select ? as value")?;
+        assert!(unresolved.prepared_schema().is_err());
+        unresolved.raw_bind_parameter(1, 42_i64)?;
+        assert!(unresolved.prepared_schema().is_err());
+        assert!(db.prepare("select 1::variant")?.prepared_schema().is_err());
         Ok(())
     }
 
